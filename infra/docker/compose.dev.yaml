@@ -1,5 +1,7 @@
-# Local compose: IdP, Accounts, PostgreSQL, Mailpit, Vault
-# Production uses a separate env file; never commit real secrets.
+# Development compose only: dev Postgres credentials, Mailpit, Vault in dev
+# mode. NEVER use this file in production — use compose.prod.yaml with a
+# secret-managed env file (see infra/docker/compose.prod.yaml header and
+# docs/deployment.md §2).
 services:
   postgres:
     image: postgres:17-alpine

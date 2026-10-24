@@ -4,9 +4,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "vitest run"
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {
-    "vitest": "^3.2.0"
+    "vitest": "^3.2.0",
+    "typescript": "^5.9.0"
   }
 }

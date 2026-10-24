@@ -34,7 +34,7 @@ Issuer 固定为 `https://id.nexora-studios.tech`，Discovery 的 `issuer`、ID 
 
 Access Token 采用自包含 JWT，初始有效期建议 5–10 分钟，受众必须匹配目标资源服务器。由于 JWT 在有效期内不可服务端即时作废，账户禁用和撤销的即时生效依靠 Refresh Token 撤销、Session 撤销和高风险资源在线状态检查（见 [`data-model.md`](./data-model.md) 第 3 节）。资源服务器必须验证签名、Issuer、Audience、Expiration、权限和令牌上下文，不能只验证 JWT 签名。
 
-若启用 Refresh Token，必须绑定用户、客户端和授权关系，实施轮换、重放检测、过期和撤销。公开客户端不能依赖静态 Client Secret。
+若启用 Refresh Token，必须绑定用户、客户端和授权关系，实施轮换、重放检测、过期和撤销。公开客户端不能依赖静态 Client Secret。同一授权关系上的刷新请求串行化（按 authorization 咨询锁或单飞队列）：并发或极近连续的两个携带同一 Refresh Token 的请求，第一个完成轮换，第二个获得与第一个相同的轮换结果（新令牌），不做重放处置；轮换完成后再次使用旧令牌仍判定为重放，撤销整条授权链。
 
 第一版允许的 OIDC 声明包括 `sub`、`iss`、`aud`、`exp`、`iat`、适用时的 `auth_time`/`nonce`，以及获准的 `name`、`email`、`email_verified`。不得把内部字段全部暴露。
 
@@ -61,7 +61,7 @@ OIDC/OAuth 端点错误遵循 RFC 6749 / OIDC Core：返回 `error`、`error_des
 | 注册               | IP          | 3 次 / 小时    |
 | 邮箱验证提交       | IP          | 10 次 / 小时   |
 
-计数采用滑动窗口；触发限流返回 429；同一来源持续超阈值产生告警（见 [`deployment.md`](./deployment.md) §5）。阈值上线后结合 Staging 压测与真实误报情况修订。
+计数采用滑动窗口，**更新与判定必须原子**：使用单条原子 SQL（如 `INSERT ... ON CONFLICT DO UPDATE SET count = window.count + 1 ... RETURNING count`）或 PostgreSQL 原子操作完成递增+阈值判定，禁止先读后写的检查模式；超窗重置。触发限流返回 429；同一来源持续超阈值产生告警（见 [`deployment.md`](./deployment.md) §5）。阈值上线后结合 Staging 压测与真实误报情况修订。
 
 ## 4. 内部账户 API
 
@@ -97,7 +97,14 @@ OIDC/OAuth 端点错误遵循 RFC 6749 / OIDC Core：返回 `error`、`error_des
 | PATCH  | `/api/v1/admin/users/:id/status`            | 用户状态变更（禁用/恢复） |
 | GET    | `/api/v1/admin/users/:id/authorizations`    | 用户授权关系查询         |
 | DELETE | `/api/v1/admin/users/:id/authorizations/:client_id` | 撤销用户对指定客户端的授权 |
-| GET    | `/api/v1/admin/audit-events`                | 审计查询（分页、按主体/类型/时间过滤） |
+| GET    | `/api/v1/admin/audit-events`                | 审计查询分页、按主体/类型/时间过滤   |
+| POST   | `/api/v1/admin/grants`                      | 授予管理员角色（写入审计）           |
+| DELETE | `/api/v1/admin/grants/:grant_id`            | 撤销管理员授权（写入审计）           |
+| GET    | `/api/v1/admin/grants`                      | 管理员授权列表（含历史）             |
+
+授权与撤销 API 仅限已持有相应管理角色且通过再次认证/MFA 的调用方；所有管理员授权变更（含首次引导）写入审计。
+
+**首个管理员引导：**不存在任何有效 `admin_grants` 行时，通过一次性引导令牌创建首管：在部署主机上以运维命令（如 `pnpm --filter @nexora/idp admin:bootstrap --user <uuid>`）直接写入首条 `admin_grants`，命令本身要求主机级访问（操作者已越过应用边界），令牌仅存在于该主机会话，不经过 HTTP API；引导成功写审计事件（`actor_user_id` 为空、`metadata.bootstrap = true`）。此后一切变更走 API。
 
 管理员操作必须记录主体、目标、结果和时间；管理接口应使用最小权限、额外 MFA 或网络访问控制。
 
@@ -119,6 +126,17 @@ Client -> validate token and identify (iss, sub)
 
 客户端通过 Discovery/JWKS 验证 ID Token 的算法、签名、`iss`、`aud`、`exp`、`iat`、合理时钟窗口和请求中的 `nonce`。
 
-## 7. 客户端验收用例
+## 7. 登出与撤销
+
+`/logout` 契约：
+
+1. 结束 IdP 登录会话：撤销服务端 Session 记录（设 `revoked_at`），清除会话 Cookie（Host-only、`Secure`、`HttpOnly`、过期时间置过去）。
+2. 撤销该会话关联的协议状态（oidc-provider interaction/grant 绑定）。
+3. RP-Initiated Logout：接受 `id_token_hint` 与 `post_logout_redirect_uri`，后者必须在客户端登记的登出回调白名单内且校验通过后才跳转；未提供 `id_token_hint` 时需用户确认。
+4. 边界声明：登出仅结束 IdP 侧会话，不自动结束业务产品自己的本地会话，也不一定撤销其 Access Token；产品应自行处理本地登出。
+
+账户禁用、密码变更和授权撤销不能只依赖浏览器登出；应结合短期 Access Token、Session 撤销、Refresh Token 撤销和高风险资源的状态检查。首期不实现 Front/Back-Channel Logout，后续需要时单独评审。
+
+## 8. 客户端验收用例
 
 必须覆盖 Discovery/Issuer/JWKS、成功授权码流程、PKCE、错误回调地址、错误 Audience、过期令牌、错误签名、授权码重放、无效 Client ID、无效 Scope、未经授权声明不返回，以及 Refresh Token 轮换与重放检测（重用已轮换的 Refresh Token 必须失败并撤销对应授权链）。完整安全场景见 [`threat-model.md`](./threat-model.md)。

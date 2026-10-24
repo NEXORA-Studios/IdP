@@ -14,11 +14,12 @@
 
 ## 2. 运行组件
 
-部署目标为单台主机上的 Docker Compose；不引入 Kubernetes 或云托管中间件。本地与生产使用同一套 Compose 编排，通过 env 文件区分配置。
+部署目标为单台主机上的 Docker Compose；不引入 Kubernetes 或云托管中间件。开发与生产使用不同的编排文件，防止内部端口与固定凭据进入生产：
 
-本地 Docker Compose 至少运行 IdP、Accounts、PostgreSQL，必要时加入邮件测试服务（如 Mailpit）。生产在 Compose 之上增加：Caddy 容器作为反向代理负责 TLS 证书自动续期、定时清理任务（随 IdP 进程内运行，见 [`data-model.md`](./data-model.md) §3.1）、以及轻量监控栈（Prometheus + Grafana 或等价方案，可选；最低要求为 healthcheck + 日志采集 + 备份脚本）。
+- 开发：`infra/docker/compose.dev.yaml`——PostgreSQL、Mailpit、Vault（dev 模式），为本地调试发布端口并使用固定开发凭据；禁止用于任何可被不可信网络访问的主机。
+- 生产：`infra/docker/compose.prod.yaml`——只有 Caddy 向公网发布 80/443；PostgreSQL、Vault、应用端口一律不发布到宿主机；凭据全部通过 env 文件注入（`infra/deploy/production.env`，权限 600、不入仓库），不内置任何默认密码；无 Mailpit，邮件走配置的 SMTP 服务商；Vault 以文件存储后端运行并自动 unseal。生产 env 模板见 `infra/deploy/production.env.example`。
 
-应用内部端口和 PostgreSQL 只监听 Compose 内部网络，不发布到主机公网接口；不能照搬开发环境默认端口和凭据。
+发布前检查项（生产门槛清单的一部分）：确认使用的是 `compose.prod.yaml`，且宿主机上除 80/443 外无监听公网接口的端口。
 
 ## 3. 配置与秘密
 
@@ -55,14 +56,16 @@ SMTP_PASSWORD=
 
 ### 6.1 CI 门禁
 
-所有变更进入主分支前必须通过 CI：
+所有变更进入主分支前必须通过 CI；门禁由仓库内的 CI 工作流（`.github/workflows/ci.yml`）强制执行，包括：
 
-- Lint、类型检查（TypeScript strict）。
+- Lint（ESLint，随工作区包脚本运行）、类型检查（TypeScript strict，含 `test/` 目录的 no-emit 检查）。
 - 单元测试与集成测试（Vitest，含数据库迁移可重放性检查）。
 - OIDC 回归测试与安全测试套件（自建，每次提交）。
 - OIDC Conformance：自建回归套件日常运行；官方 OpenID Foundation Conformance Suite（Basic + PKCE profile）在 Staging 环境执行，作为首次发布门禁，并在每次 `oidc-provider` 协议库升级后重跑；不作为每次提交的 CI 步骤。
 - E2E（Playwright，覆盖注册-登录-授权-令牌验证关键路径）。
 - 构建验证：Docker 镜像可构建，镜像内不包含源码外的秘密。
+
+工作流在 pnpm install 后依次执行 `turbo run lint typecheck test build`；迁移可重放性检查与 E2E 在带 PostgreSQL 服务的 job 中运行。无对应检查能力的变更不得绕过工作流直接合入。
 
 依赖更新通过锁定文件评审，`pnpm-lock.yaml` 变更触发完整测试。
 
@@ -80,6 +83,7 @@ SMTP_PASSWORD=
 
 ## 7. 生产门槛
 
+- [ ] 使用 `compose.prod.yaml`，内部服务（PostgreSQL、Vault、应用端口）未发布到宿主机公网接口。
 - [ ] Local、Staging、Production 已隔离。
 - [ ] TLS、固定 Issuer、Discovery 和 JWKS 正确。
 - [ ] 生产签名密钥和开发密钥分离。

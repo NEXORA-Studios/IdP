@@ -41,10 +41,9 @@ params JSONB NOT NULL DEFAULT '{}'
 created_at TIMESTAMPTZ NOT NULL
 updated_at TIMESTAMPTZ NOT NULL
 changed_at TIMESTAMPTZ NULL
-UNIQUE (user_id, credential_type)
 ```
 
-首期 `credential_type` 仅有 `password`，`secret_hash` 保存 Argon2id 哈希与算法参数（写入 `params`），`changed_at` 即密码变更时间；不保存明文密码，也不以可逆加密替代密码哈希。表结构必须可容纳未来的 TOTP、Passkey 等凭据类型，不允许为新增凭据类型修改主键或重建表。
+首期 `credential_type` 仅 `password`（保留 `UNIQUE (user_id, credential_type)` 约束）；Passkey/TOTP 等可多实例凭据类型使用不同的唯一规则（`UNIQUE (user_id, credential_type, external_id)`，唯一索引仅约束相应类型），因此同一用户可注册多个 Passkey。`secret_hash` 保存 Argon2id 哈希与算法参数（写入 `params`），`changed_at` 即密码变更时间；不保存明文密码，也不以可逆加密替代密码哈希。表结构必须可容纳未来的 TOTP、Passkey 等凭据类型，不允许为新增凭据类型修改主键或重建表。
 
 ### `user_emails`
 
@@ -59,7 +58,11 @@ created_at TIMESTAMPTZ NOT NULL
 updated_at TIMESTAMPTZ NOT NULL
 ```
 
-对 `email_normalized` 建立全局唯一索引（部分唯一索引：仅约束 `verified_at IS NOT NULL` 的记录），并对 `user_id` 建立普通索引。邮箱变更必须重新验证，未验证邮箱不能用于密码恢复，主要邮箱变更须审计。账户软删除或删除流程必须释放其已验证邮箱（移除或标记对应 `user_emails` 记录），否则该邮箱无法重新注册。
+对 `email_normalized` 建立全局唯一索引（部分唯一索引：仅约束 `verified_at IS NOT NULL` 的记录），并对 `user_id` 建立普通索引。`email_normalized` 的规范化规则唯一且集中定义（小写、UTF-8 NFC、仅一个 `@`、去空白），由 `packages/identity` 的单一函数提供；所有写入与查询路径（注册、验证、变更、恢复、登录标识解析、管理查询）必须经该函数，禁止各自实现。
+
+主邮箱唯一性由部分唯一索引强制：`CREATE UNIQUE INDEX ... ON user_emails (user_id) WHERE is_primary`，每个用户至多一行 `is_primary = TRUE`。
+
+邮箱变更必须重新验证，未验证邮箱不能用于密码恢复，主要邮箱变更须审计。账户软删除或删除流程必须释放其已验证邮箱（移除或标记对应 `user_emails` 记录），否则该邮箱无法重新注册。
 
 ### `sessions`
 
@@ -93,7 +96,12 @@ one_time_tokens(
 )
 ```
 
-只保存令牌哈希；令牌单次使用、有时效，按用途（`email_verification`、`password_reset` 等）区分；签发同用途新令牌必须使同用户的旧令牌失效。
+只保存令牌哈希；令牌单次使用、有时效，按用途（`email_verification`、`password_reset` 等）区分。`token_hash` 上建立唯一索引（直接索引，非部分索引）：令牌哈希为高熵随机值，全局唯一，查找走索引扫描。
+
+**原子性要求：**
+
+- 兑换：`UPDATE one_time_tokens SET used_at = now() WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now()`，以受影响行数判定成功；副作用的写入（密码更新、邮箱验证）与该 UPDATE 处于同一事务。并发兑换同一令牌时，仅一个事务能更新该行，另一个必须回滚失败。
+- 签发：签发同用途新令牌与旧令牌失效在同一事务内，且对 `(user_id, purpose)` 使用咨询锁（`pg_advisory_xact_lock`）串行化，确保并发签发后仅剩一个有效令牌。
 
 ### OAuth 客户端
 
@@ -104,6 +112,7 @@ oauth_clients(
   client_type TEXT NOT NULL,
   token_endpoint_auth_method TEXT NOT NULL,
   secret_hash TEXT NULL,
+  secret_previous_hash TEXT NULL,
   secret_created_at TIMESTAMPTZ NULL,
   secret_rotated_at TIMESTAMPTZ NULL,
   allowed_scopes TEXT NOT NULL,
@@ -121,7 +130,7 @@ oauth_redirect_uris(
 )
 ```
 
-`token_endpoint_auth_method` 取值遵循 OAuth 2.0 客户端认证规范（如 `client_secret_basic`、`client_secret_post`、`none`）；`allowed_scopes` 是该客户端可请求的 Scope 白名单，授权请求的 Scope 必须是其子集。授权请求必须严格匹配登记的 Redirect URI。Client Secret 仅适用于机密客户端，仅存哈希（与密码同等强度存储），创建或轮换时只展示一次；轮换支持新旧 Secret 短暂并行验证，旧 Secret 在过渡期后失效。`post_logout_redirect_uris` 为 RP-Initiated Logout 回调白名单（见 [`api.md`](./api.md) §7）。
+`token_endpoint_auth_method` 取值遵循 OAuth 2.0 客户端认证规范（如 `client_secret_basic`、`client_secret_post`、`none`）；`allowed_scopes` 是该客户端可请求的 Scope 白名单，授权请求的 Scope 必须是其子集。授权请求必须严格匹配登记的 Redirect URI。Client Secret 仅适用于机密客户端，仅存哈希（与密码同等强度存储），创建或轮换时只展示一次。轮换语义：新 Secret 写入 `secret_hash`，旧哈希移入 `secret_previous_hash` 并记录 `secret_rotated_at`；过渡期内两个哈希均可用（先比对新哈希，命中失败再比对旧哈希），超过过渡期（默认 24h，部署可配）后台任务将 `secret_previous_hash` 置空。`post_logout_redirect_uris` 为 RP-Initiated Logout 回调白名单（见 [`api.md`](./api.md) §7）。
 
 ### 授权关系
 
@@ -166,12 +175,12 @@ admin_grants(
   granted_by UUID NOT NULL REFERENCES users(id),
   granted_at TIMESTAMPTZ NOT NULL,
   expires_at TIMESTAMPTZ NULL,
-  revoked_at TIMESTAMPTZ NULL,
-  UNIQUE (user_id, role)
+  revoked_at TIMESTAMPTZ NULL
 )
+CREATE INDEX admin_grants_user_role_idx ON admin_grants (user_id, role);
 ```
 
-管理 API 在每次请求时校验有效（未过期、未撤销）的授权，并要求再次认证或 MFA；授权与撤销操作必须写入审计。
+同一 `(user_id, role)` 可存在多行历史授予（各自有效期与撤销时间），重新授予插入新行，不更新旧行，保留完整授予历史。有效性判定只看是否存在未过期、未撤销且 `granted_at` 最新的行；管理 API 在每次请求时校验有效授权，并要求再次认证或 MFA；授权与撤销操作必须写入审计（见 [`api.md`](./api.md) §5）。
 
 ### `audit_events`
 
@@ -186,7 +195,7 @@ created_at TIMESTAMPTZ NOT NULL
 metadata JSONB NULL
 ```
 
-采用追加式写入。`metadata` 不得包含密码、完整令牌、授权码、Cookie、Client Secret、私钥或其他认证秘密。
+采用追加式写入。管理端变更（客户端、用户状态、授权、管理员授权）与对应 `audit_events` 写入处于**同一数据库事务**：变更提交则审计必已提交，反之回滚。跨服务或异步路径使用事务性 outbox 表（同事务写入待发审计记录，后台投递并重试），确保审计不丢失。`metadata` 不得包含密码、完整令牌、授权码、Cookie、Client Secret、私钥或其他认证秘密。
 
 ## 3. 协议库存储
 
