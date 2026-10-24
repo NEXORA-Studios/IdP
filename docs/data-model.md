@@ -33,14 +33,17 @@ deleted_at TIMESTAMPTZ NULL
 ### `user_credentials`
 
 ```text
-user_id UUID PRIMARY KEY REFERENCES users(id)
-password_hash TEXT NOT NULL
-password_changed_at TIMESTAMPTZ NOT NULL
+id UUID PRIMARY KEY
+user_id UUID NOT NULL REFERENCES users(id)
+credential_type TEXT NOT NULL
+secret_hash TEXT NOT NULL
+params JSONB NOT NULL DEFAULT '{}'
 created_at TIMESTAMPTZ NOT NULL
 updated_at TIMESTAMPTZ NOT NULL
+changed_at TIMESTAMPTZ NULL
 ```
 
-只保存 Argon2id 哈希和算法参数，不保存明文密码，也不以可逆加密替代密码哈希。
+首期 `credential_type` 仅 `password`（保留 `UNIQUE (user_id, credential_type)` 约束）；Passkey/TOTP 等可多实例凭据类型使用不同的唯一规则（`UNIQUE (user_id, credential_type, external_id)`，唯一索引仅约束相应类型），因此同一用户可注册多个 Passkey。`secret_hash` 保存 Argon2id 哈希与算法参数（写入 `params`），`changed_at` 即密码变更时间；不保存明文密码，也不以可逆加密替代密码哈希。表结构必须可容纳未来的 TOTP、Passkey 等凭据类型，不允许为新增凭据类型修改主键或重建表。
 
 ### `user_emails`
 
@@ -55,7 +58,11 @@ created_at TIMESTAMPTZ NOT NULL
 updated_at TIMESTAMPTZ NOT NULL
 ```
 
-按明确规则规范化并建立唯一索引。邮箱变更必须重新验证，未验证邮箱不能用于密码恢复，主要邮箱变更须审计。
+对 `email_normalized` 建立全局唯一索引（部分唯一索引：仅约束 `verified_at IS NOT NULL` 的记录），并对 `user_id` 建立普通索引。`email_normalized` 的规范化规则唯一且集中定义（小写、UTF-8 NFC、仅一个 `@`、去空白），由 `packages/identity` 的单一函数提供；所有写入与查询路径（注册、验证、变更、恢复、登录标识解析、管理查询）必须经该函数，禁止各自实现。
+
+主邮箱唯一性由部分唯一索引强制：`CREATE UNIQUE INDEX ... ON user_emails (user_id) WHERE is_primary`，每个用户至多一行 `is_primary = TRUE`。
+
+邮箱变更必须重新验证，未验证邮箱不能用于密码恢复，主要邮箱变更须审计。账户软删除或删除流程必须释放其已验证邮箱（移除或标记对应 `user_emails` 记录），否则该邮箱无法重新注册。
 
 ### `sessions`
 
@@ -67,9 +74,34 @@ last_seen_at TIMESTAMPTZ NULL
 expires_at TIMESTAMPTZ NOT NULL
 revoked_at TIMESTAMPTZ NULL
 auth_time TIMESTAMPTZ NULL
+user_agent TEXT NULL
+ip TEXT NULL
 ```
 
-Session ID 必须不可预测，过期或撤销后不可用，支持单会话和全账号撤销；Session ID 不能使用用户 ID。
+Session ID 必须不可预测，过期或撤销后不可用，支持单会话和全账号撤销；Session ID 不能使用用户 ID。`user_agent` 和 `ip` 用于“查询会话”功能展示和异常登录排查，属于个人信息，展示时脱敏；过期会话定期清理（见 §3.1）。
+
+### 一次性令牌
+
+邮箱验证令牌和密码重置令牌是核心业务对象，必须持久化并支持审计、撤销和清理：
+
+```text
+one_time_tokens(
+  id UUID PRIMARY KEY,
+  user_id UUID NOT NULL REFERENCES users(id),
+  purpose TEXT NOT NULL,
+  token_hash TEXT NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  used_at TIMESTAMPTZ NULL,
+  created_at TIMESTAMPTZ NOT NULL
+)
+```
+
+只保存令牌哈希；令牌单次使用、有时效，按用途（`email_verification`、`password_reset` 等）区分。`token_hash` 上建立唯一索引（直接索引，非部分索引）：令牌哈希为高熵随机值，全局唯一，查找走索引扫描。
+
+**原子性要求：**
+
+- 兑换：`UPDATE one_time_tokens SET used_at = now() WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now()`，以受影响行数判定成功；副作用的写入（密码更新、邮箱验证）与该 UPDATE 处于同一事务。并发兑换同一令牌时，仅一个事务能更新该行，另一个必须回滚失败。
+- 签发：签发同用途新令牌与旧令牌失效在同一事务内，且对 `(user_id, purpose)` 使用咨询锁（`pg_advisory_xact_lock`）串行化，确保并发签发后仅剩一个有效令牌。
 
 ### OAuth 客户端
 
@@ -78,6 +110,13 @@ oauth_clients(
   client_id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   client_type TEXT NOT NULL,
+  token_endpoint_auth_method TEXT NOT NULL,
+  secret_hash TEXT NULL,
+  secret_previous_hash TEXT NULL,
+  secret_created_at TIMESTAMPTZ NULL,
+  secret_rotated_at TIMESTAMPTZ NULL,
+  allowed_scopes TEXT NOT NULL,
+  post_logout_redirect_uris TEXT[] NOT NULL DEFAULT '{}',
   status TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL
@@ -86,19 +125,12 @@ oauth_redirect_uris(
   id UUID PRIMARY KEY,
   client_id TEXT NOT NULL REFERENCES oauth_clients(client_id),
   uri TEXT NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL
-)
-oauth_client_secrets(
-  id UUID PRIMARY KEY,
-  client_id TEXT NOT NULL REFERENCES oauth_clients(client_id),
-  secret_hash TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL,
-  expires_at TIMESTAMPTZ NULL,
-  revoked_at TIMESTAMPTZ NULL
+  UNIQUE (client_id, uri)
 )
 ```
 
-同一客户端的 Redirect URI 去重，授权请求必须严格匹配登记值。Client Secret 仅适用于机密客户端，创建或轮换时只展示一次；存储方式必须符合实际客户端认证方案。
+`token_endpoint_auth_method` 取值遵循 OAuth 2.0 客户端认证规范（如 `client_secret_basic`、`client_secret_post`、`none`）；`allowed_scopes` 是该客户端可请求的 Scope 白名单，授权请求的 Scope 必须是其子集。授权请求必须严格匹配登记的 Redirect URI。Client Secret 仅适用于机密客户端，仅存哈希（与密码同等强度存储），创建或轮换时只展示一次。轮换语义：新 Secret 写入 `secret_hash`，旧哈希移入 `secret_previous_hash` 并记录 `secret_rotated_at`；过渡期内两个哈希均可用（先比对新哈希，命中失败再比对旧哈希），超过过渡期（默认 24h，部署可配）后台任务将 `secret_previous_hash` 置空。`post_logout_redirect_uris` 为 RP-Initiated Logout 回调白名单（见 [`api.md`](./api.md) §7）。
 
 ### 授权关系
 
@@ -131,6 +163,25 @@ created_at TIMESTAMPTZ NOT NULL
 
 对 `(issuer, subject)` 建立唯一约束。外部身份绑定应与本地账户模型分离，不能仅凭相同邮箱自动合并。
 
+### 管理员授权
+
+管理员权限独立于普通用户会话，必须显式授予、可撤销、可审计：
+
+```text
+admin_grants(
+  id UUID PRIMARY KEY,
+  user_id UUID NOT NULL REFERENCES users(id),
+  role TEXT NOT NULL,
+  granted_by UUID NOT NULL REFERENCES users(id),
+  granted_at TIMESTAMPTZ NOT NULL,
+  expires_at TIMESTAMPTZ NULL,
+  revoked_at TIMESTAMPTZ NULL
+)
+CREATE INDEX admin_grants_user_role_idx ON admin_grants (user_id, role);
+```
+
+同一 `(user_id, role)` 可存在多行历史授予（各自有效期与撤销时间），重新授予插入新行，不更新旧行，保留完整授予历史。有效性判定只看是否存在未过期、未撤销且 `granted_at` 最新的行；管理 API 在每次请求时校验有效授权，并要求再次认证或 MFA；授权与撤销操作必须写入审计（见 [`api.md`](./api.md) §5）。
+
 ### `audit_events`
 
 ```text
@@ -144,11 +195,23 @@ created_at TIMESTAMPTZ NOT NULL
 metadata JSONB NULL
 ```
 
-采用追加式写入。`metadata` 不得包含密码、完整令牌、授权码、Cookie、Client Secret、私钥或其他认证秘密。
+采用追加式写入。管理端变更（客户端、用户状态、授权、管理员授权）与对应 `audit_events` 写入处于**同一数据库事务**：变更提交则审计必已提交，反之回滚。跨服务或异步路径使用事务性 outbox 表（同事务写入待发审计记录，后台投递并重试），确保审计不丢失。`metadata` 不得包含密码、完整令牌、授权码、Cookie、Client Secret、私钥或其他认证秘密。
 
 ## 3. 协议库存储
 
-根据所选 Adapter 保存 Authorization Code、Access Token 状态、Refresh Token、Grant、Interaction 及其他协议对象。短期对象必须有过期和清理机制；其内部模型不应泄露到 Identity Core。
+协议库 Adapter 位于 `packages/oidc`（见 [`architecture.md`](./architecture.md) §5），通过 `db` 包访问协议存储表。根据所选 Adapter 保存 Authorization Code、Access Token 状态、Refresh Token、Grant、Interaction 及其他协议对象。短期对象必须有过期和清理机制；其内部模型不应泄露到 Identity Core。
+
+### 3.1 定期清理任务
+
+过期数据的清理由应用内定时任务执行（单机部署，IdP 进程内简单间隔任务即可，不引入独立调度基础设施）：
+
+- 过期/撤销 Session、一次性令牌：每日清理。
+- 协议库短期对象（授权码、Interaction、过期 Grant/Token 记录）：利用 `oidc-provider` Adapter 的 TTL 支持批量清理，每日执行。
+- 审计事件不自动清理，按保留策略归档。
+
+清理任务执行结果写入日志，失败时告警（见 [`deployment.md`](./deployment.md) §5）。
+
+Access Token 采用自包含 JWT（资源服务器离线验证签名）。因此撤销语义为：JWT 在有效期内不可服务端即时作废（`/introspect` 仅用于需要更强即时性的内部高价值资源，按需启用）；账户禁用、密码变更和授权撤销的即时生效依靠 Refresh Token 撤销、Session 撤销和高风险资源在线状态检查，而不是 Access Token 撤销。协议库中的 Access Token 状态记录仅用于刷新与撤销联动，不作为资源服务器的验证依据。
 
 ## 4. 迁移规则
 

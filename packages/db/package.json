@@ -1,0 +1,28 @@
+{
+  "name": "@nexora/db",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "migrate": "tsx src/migrate.ts",
+    "generate": "drizzle-kit generate",
+    "lint": "eslint ."
+  },
+  "devDependencies": {
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0",
+    "drizzle-kit": "^0.31.0",
+    "tsx": "^4.20.0",
+    "pg": "^8.16.0",
+    "@types/pg": "^8.15.0",
+    "eslint": "^9.30.0",
+    "typescript-eslint": "^8.35.0"
+  },
+  "dependencies": {
+    "drizzle-orm": "^0.44.0"
+  }
+}
