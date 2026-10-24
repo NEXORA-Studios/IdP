@@ -1,0 +1,14 @@
+node_modules
+dist
+*.tsbuildinfo
+.turbo/
+coverage/
+
+# env & secrets
+.env
+.env.*
+!.env.example
+infra/deploy/*.env
+
+# vault dev data
+infra/docker/vault-data/

@@ -1,0 +1,42 @@
+# Local compose: IdP, Accounts, PostgreSQL, Mailpit, Vault
+# Production uses a separate env file; never commit real secrets.
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: nexora
+      POSTGRES_PASSWORD: nexora_dev_only
+      POSTGRES_DB: nexora_idp
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nexora -d nexora_idp"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  mailpit:
+    image: axllent/mailpit:latest
+    ports:
+      - "8025:8025" # web UI
+      - "1025:1025" # SMTP
+    volumes:
+      - mailpitdata:/data
+
+  vault:
+    image: hashicorp/vault:1.19
+    cap_add:
+      - IPC_LOCK
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: dev-root-token
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    ports:
+      - "8200:8200"
+    # Dev: -dev mode. Production compose uses file storage backend +
+    # auto-unseal script instead (see docs/deployment.md §3).
+
+volumes:
+  pgdata:
+  mailpitdata:
