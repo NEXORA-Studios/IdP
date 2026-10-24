@@ -75,7 +75,11 @@ Cookie 默认使用 Host-only、`Secure`、`HttpOnly` 和合适的 `SameSite`，
 
 ### 4.3 技术栈
 
-Node.js LTS、TypeScript、pnpm、Fastify、`oidc-provider`、Next.js、PostgreSQL、Drizzle ORM、Zod、Argon2id、Vitest、Playwright、Docker、Docker Compose，以及受支持的邮件服务和 Secret Manager。协议核心不得自行实现。
+Node.js 24 LTS、TypeScript（strict）、pnpm workspace + turborepo、Fastify、`oidc-provider`、Next.js、PostgreSQL、Drizzle ORM、Zod、Argon2id、Pino（`packages/logging` 封装脱敏规则）、Vitest、Playwright、Docker、Docker Compose。协议核心不得自行实现。
+
+邮件发送不绑定具体服务商：`packages/emails` 定义 Sender 接口，本地/CI 用 Mailpit（SMTP），生产接入方式待选型后注入。
+
+签名密钥与运行时秘密使用 HashiCorp Vault，以单实例容器跑在同一主机的 Compose 内（文件存储后端，自动 unseal 脚本），`SIGNING_KEY_REFERENCE` 指向 Vault 路径；备份、unseal 凭据和访问策略见 [`deployment.md`](./deployment.md)。
 
 依赖版本需锁定，提交 `pnpm-lock.yaml`，协议库升级前执行完整 OIDC 回归测试。
 

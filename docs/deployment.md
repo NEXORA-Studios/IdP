@@ -28,14 +28,16 @@ PUBLIC_ISSUER=https://id.nexora-studios.tech
 ACCOUNTS_BASE_URL=https://accounts.nexora-studios.tech
 DATABASE_URL=
 SESSION_SECRET=
-SIGNING_KEY_REFERENCE=
+VAULT_ADDR=
+VAULT_TOKEN=
+SIGNING_KEY_REFERENCE=secret/data/nexora-idp/signing
 SMTP_HOST=
 SMTP_PORT=
 SMTP_USER=
 SMTP_PASSWORD=
 ```
 
-示例只表示配置类别。真实密码、生产密钥和令牌不得写入仓库、示例文件或构建日志。`SESSION_SECRET` 使用密码学安全随机值，必须支持双密钥并行验证的轮换流程（新签名、新旧双验，旧密钥超过会话有效期后退役）；`SIGNING_KEY_REFERENCE` 指向受控密钥存储，而不是任意文件路径。签名私钥不提交 Git、不打包进前端或桌面客户端。单机部署下的 Secret Manager 可用受限权限的 env 文件（磁盘权限 600、不入仓库）或 Docker Secrets 承载，生产 env 文件只存在于部署主机。
+示例只表示配置类别。真实密码、生产密钥和令牌不得写入仓库、示例文件或构建日志。`SESSION_SECRET` 使用密码学安全随机值，必须支持双密钥并行验证的轮换流程（新签名、新旧双验，旧密钥超过会话有效期后退役）。签名私钥与运行时秘密存于 Vault（Compose 单实例，文件存储后端 + 自动 unseal 脚本）：应用用 AppRole 或一次性 token 认证，访问策略最小化；unseal 凭据与 Vault 存储目录必须纳入主机备份。`SIGNING_KEY_REFERENCE` 指向 Vault 内路径，不指向文件系统。签名私钥不提交 Git、不打包进前端或桌面客户端。
 
 ## 4. 数据库与恢复
 
