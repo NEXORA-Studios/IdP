@@ -33,14 +33,18 @@ deleted_at TIMESTAMPTZ NULL
 ### `user_credentials`
 
 ```text
-user_id UUID PRIMARY KEY REFERENCES users(id)
-password_hash TEXT NOT NULL
-password_changed_at TIMESTAMPTZ NOT NULL
+id UUID PRIMARY KEY
+user_id UUID NOT NULL REFERENCES users(id)
+credential_type TEXT NOT NULL
+secret_hash TEXT NOT NULL
+params JSONB NOT NULL DEFAULT '{}'
 created_at TIMESTAMPTZ NOT NULL
 updated_at TIMESTAMPTZ NOT NULL
+changed_at TIMESTAMPTZ NULL
+UNIQUE (user_id, credential_type)
 ```
 
-只保存 Argon2id 哈希和算法参数，不保存明文密码，也不以可逆加密替代密码哈希。
+首期 `credential_type` 仅有 `password`，`secret_hash` 保存 Argon2id 哈希与算法参数（写入 `params`），`changed_at` 即密码变更时间；不保存明文密码，也不以可逆加密替代密码哈希。表结构必须可容纳未来的 TOTP、Passkey 等凭据类型，不允许为新增凭据类型修改主键或重建表。
 
 ### `user_emails`
 
@@ -55,7 +59,7 @@ created_at TIMESTAMPTZ NOT NULL
 updated_at TIMESTAMPTZ NOT NULL
 ```
 
-按明确规则规范化并建立唯一索引。邮箱变更必须重新验证，未验证邮箱不能用于密码恢复，主要邮箱变更须审计。
+对 `email_normalized` 建立全局唯一索引（部分唯一索引：仅约束 `verified_at IS NOT NULL` 的记录），并对 `user_id` 建立普通索引。邮箱变更必须重新验证，未验证邮箱不能用于密码恢复，主要邮箱变更须审计。账户软删除或删除流程必须释放其已验证邮箱（移除或标记对应 `user_emails` 记录），否则该邮箱无法重新注册。
 
 ### `sessions`
 
@@ -67,9 +71,29 @@ last_seen_at TIMESTAMPTZ NULL
 expires_at TIMESTAMPTZ NOT NULL
 revoked_at TIMESTAMPTZ NULL
 auth_time TIMESTAMPTZ NULL
+user_agent TEXT NULL
+ip TEXT NULL
 ```
 
-Session ID 必须不可预测，过期或撤销后不可用，支持单会话和全账号撤销；Session ID 不能使用用户 ID。
+Session ID 必须不可预测，过期或撤销后不可用，支持单会话和全账号撤销；Session ID 不能使用用户 ID。`user_agent` 和 `ip` 用于“查询会话”功能展示和异常登录排查，属于个人信息，展示时脱敏；过期会话定期清理（见 §3.1）。
+
+### 一次性令牌
+
+邮箱验证令牌和密码重置令牌是核心业务对象，必须持久化并支持审计、撤销和清理：
+
+```text
+one_time_tokens(
+  id UUID PRIMARY KEY,
+  user_id UUID NOT NULL REFERENCES users(id),
+  purpose TEXT NOT NULL,
+  token_hash TEXT NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  used_at TIMESTAMPTZ NULL,
+  created_at TIMESTAMPTZ NOT NULL
+)
+```
+
+只保存令牌哈希；令牌单次使用、有时效，按用途（`email_verification`、`password_reset` 等）区分；签发同用途新令牌必须使同用户的旧令牌失效。
 
 ### OAuth 客户端
 
@@ -78,6 +102,12 @@ oauth_clients(
   client_id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   client_type TEXT NOT NULL,
+  token_endpoint_auth_method TEXT NOT NULL,
+  secret_hash TEXT NULL,
+  secret_created_at TIMESTAMPTZ NULL,
+  secret_rotated_at TIMESTAMPTZ NULL,
+  allowed_scopes TEXT NOT NULL,
+  post_logout_redirect_uris TEXT[] NOT NULL DEFAULT '{}',
   status TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL
@@ -86,19 +116,12 @@ oauth_redirect_uris(
   id UUID PRIMARY KEY,
   client_id TEXT NOT NULL REFERENCES oauth_clients(client_id),
   uri TEXT NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL
-)
-oauth_client_secrets(
-  id UUID PRIMARY KEY,
-  client_id TEXT NOT NULL REFERENCES oauth_clients(client_id),
-  secret_hash TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL,
-  expires_at TIMESTAMPTZ NULL,
-  revoked_at TIMESTAMPTZ NULL
+  UNIQUE (client_id, uri)
 )
 ```
 
-同一客户端的 Redirect URI 去重，授权请求必须严格匹配登记值。Client Secret 仅适用于机密客户端，创建或轮换时只展示一次；存储方式必须符合实际客户端认证方案。
+`token_endpoint_auth_method` 取值遵循 OAuth 2.0 客户端认证规范（如 `client_secret_basic`、`client_secret_post`、`none`）；`allowed_scopes` 是该客户端可请求的 Scope 白名单，授权请求的 Scope 必须是其子集。授权请求必须严格匹配登记的 Redirect URI。Client Secret 仅适用于机密客户端，仅存哈希（与密码同等强度存储），创建或轮换时只展示一次；轮换支持新旧 Secret 短暂并行验证，旧 Secret 在过渡期后失效。`post_logout_redirect_uris` 为 RP-Initiated Logout 回调白名单（见 [`api.md`](./api.md) §7）。
 
 ### 授权关系
 
@@ -131,6 +154,25 @@ created_at TIMESTAMPTZ NOT NULL
 
 对 `(issuer, subject)` 建立唯一约束。外部身份绑定应与本地账户模型分离，不能仅凭相同邮箱自动合并。
 
+### 管理员授权
+
+管理员权限独立于普通用户会话，必须显式授予、可撤销、可审计：
+
+```text
+admin_grants(
+  id UUID PRIMARY KEY,
+  user_id UUID NOT NULL REFERENCES users(id),
+  role TEXT NOT NULL,
+  granted_by UUID NOT NULL REFERENCES users(id),
+  granted_at TIMESTAMPTZ NOT NULL,
+  expires_at TIMESTAMPTZ NULL,
+  revoked_at TIMESTAMPTZ NULL,
+  UNIQUE (user_id, role)
+)
+```
+
+管理 API 在每次请求时校验有效（未过期、未撤销）的授权，并要求再次认证或 MFA；授权与撤销操作必须写入审计。
+
 ### `audit_events`
 
 ```text
@@ -148,7 +190,19 @@ metadata JSONB NULL
 
 ## 3. 协议库存储
 
-根据所选 Adapter 保存 Authorization Code、Access Token 状态、Refresh Token、Grant、Interaction 及其他协议对象。短期对象必须有过期和清理机制；其内部模型不应泄露到 Identity Core。
+协议库 Adapter 位于 `packages/oidc`（见 [`architecture.md`](./architecture.md) §5），通过 `db` 包访问协议存储表。根据所选 Adapter 保存 Authorization Code、Access Token 状态、Refresh Token、Grant、Interaction 及其他协议对象。短期对象必须有过期和清理机制；其内部模型不应泄露到 Identity Core。
+
+### 3.1 定期清理任务
+
+过期数据的清理由应用内定时任务执行（单机部署，IdP 进程内简单间隔任务即可，不引入独立调度基础设施）：
+
+- 过期/撤销 Session、一次性令牌：每日清理。
+- 协议库短期对象（授权码、Interaction、过期 Grant/Token 记录）：利用 `oidc-provider` Adapter 的 TTL 支持批量清理，每日执行。
+- 审计事件不自动清理，按保留策略归档。
+
+清理任务执行结果写入日志，失败时告警（见 [`deployment.md`](./deployment.md) §5）。
+
+Access Token 采用自包含 JWT（资源服务器离线验证签名）。因此撤销语义为：JWT 在有效期内不可服务端即时作废（`/introspect` 仅用于需要更强即时性的内部高价值资源，按需启用）；账户禁用、密码变更和授权撤销的即时生效依靠 Refresh Token 撤销、Session 撤销和高风险资源在线状态检查，而不是 Access Token 撤销。协议库中的 Access Token 状态记录仅用于刷新与撤销联动，不作为资源服务器的验证依据。
 
 ## 4. 迁移规则
 

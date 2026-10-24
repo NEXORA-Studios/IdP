@@ -20,6 +20,7 @@ IdP 不替代业务系统的授权。例如，IdP 只确认用户身份；产品
 - OIDC Discovery、Authorization Code Flow、PKCE、ID Token、Access Token 和 JWKS。
 - 内部客户端登记、Redirect URI 管理、用户授权同意和 Scope 管理。
 - 令牌与会话撤销、安全审计、自动化测试、Docker 部署、备份和恢复流程。
+- Refresh Token 及其轮换、重放检测、过期和撤销链路。
 
 首期不实现动态公开客户端注册、第三方 OAuth/OIDC、Microsoft 登录、Minecraft 身份关联、SAML、SCIM、设备授权、多租户、多区域高可用、风险评分或自研 MFA 平台。
 
@@ -45,7 +46,7 @@ HTTPS Reverse Proxy
 +------+----------------+
 |                       |
 Accounts Portal       OIDC Provider
-(Next.js)             (Fastify)
+(Next.js, 含管理后台)  (Fastify)
 |                       |
 +----------+------------+
            |
@@ -56,9 +57,11 @@ Accounts Portal       OIDC Provider
  Backup / Audit / Key Store
 ```
 
+管理后台首期并入 Accounts Portal，作为受独立权限校验保护的 `/admin` 路由区，不单独部署；不建独立的 `apps/admin` 应用。
+
 ### 4.1 模块职责
 
-- **Accounts Web Portal**：注册、登录、登出、邮箱验证、密码重置、账户设置、授权同意和错误交互；不直接访问数据库或持有签名私钥。
+- **Accounts Web Portal**：注册、登录、登出、邮箱验证、密码重置、账户设置、授权同意和错误交互；包含受独立权限校验保护的管理路由区（客户端登记、用户状态、审计查询）；不直接访问数据库或持有签名私钥。
 - **OIDC Provider**：协议端点、授权码、PKCE、Token、Discovery、JWKS、客户端验证和协议状态。
 - **Identity Core**：用户、凭据、邮箱验证、状态、会话、恢复和账户禁用；不依赖具体 HTTP 框架。
 - **Authorization Core**：客户端策略、Scope、用户同意、撤销和资源访问规则。
@@ -66,7 +69,7 @@ Accounts Portal       OIDC Provider
 
 ### 4.2 域名和网络边界
 
-正式 Issuer 为 `https://id.nexora-studios.tech`，账户门户为 `https://accounts.nexora-studios.tech`，管理后台可使用 `https://admin.nexora-studios.tech`。公网只开放 HTTPS，PostgreSQL 和内部端口不得暴露；只信任已配置反向代理的转发头。
+正式 Issuer 为 `https://id.nexora-studios.tech`，账户门户为 `https://accounts.nexora-studios.tech`，管理功能位于门户的 `/admin` 路由区，不使用独立域名。公网只开放 HTTPS，PostgreSQL 和内部端口不得暴露；只信任已配置反向代理的转发头。
 
 Cookie 默认使用 Host-only、`Secure`、`HttpOnly` 和合适的 `SameSite`，登录成功后轮换 Session ID，状态变更请求启用 CSRF 防护，避免跨子域共享 Cookie。
 
@@ -79,14 +82,14 @@ Node.js LTS、TypeScript、pnpm、Fastify、`oidc-provider`、Next.js、PostgreS
 ## 5. 仓库边界
 
 ```text
-apps/{idp,accounts,admin}/
-packages/{db,identity,authorization,crypto,config,logging,test-utils}/
-tests/{unit,integration,oidc-conformance,security,e2e}/
+apps/{idp,accounts}/
+packages/{db,identity,authorization,oidc,emails,crypto,config,logging,test-utils}/
 infra/{docker,migrations,deploy}/
 docs/{architecture,data-model,api,threat-model,deployment}.md
 ```
 
-`identity` 不依赖 HTTP 框架，`authorization` 不依赖前端，`oidc` 负责协议库集成，`db` 负责数据访问和迁移，`crypto` 封装密码与密钥工具，`logging` 负责结构化日志和脱敏。
+`identity` 不依赖 HTTP 框架，`authorization` 不依赖前端，`oidc` 封装 `oidc-provider` 实例及其 Adapter（Adapter 通过 `db` 包访问协议存储，`oidc` 依赖 `db`，`db` 不知道 `oidc` 的存在），`db` 负责数据访问和迁移，`crypto` 封装密码与密钥工具，`logging` 负责结构化日志和脱敏，`test-utils` 提供测试夹具与内存 Adapter。`emails` 集中维护邮件模板、验证/重置链接格式和有效期展示文案，通过依赖注入接收邮件发送器；`identity` 只调用 `emails`，不自行拼接邮件内容。
+
 
 ## 6. 实施顺序
 
