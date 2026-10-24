@@ -3,5 +3,6 @@ packages:
   - "packages/*"
   - "tests/*"
 
-onlyBuiltDependencies:
-  - esbuild
+allowBuilds:
+  argon2: true
+  esbuild: true
